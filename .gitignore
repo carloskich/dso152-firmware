@@ -13,3 +13,6 @@ tools/drop_dir.txt
 
 # Claude Code local settings
 .claude/
+
+# material de divulgação (gerado)
+divulgacao/

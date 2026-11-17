@@ -1122,6 +1122,11 @@ static void draw_about(void) {
 // the signal (AUTO) or stays where the user put it; the sampling rate
 // follows the frequency so that slow and fast signals both read right.
 static const uint8_t DMM_R[] = {0, 1, 2, 4, 5, 7, 8};     // front-end ranges used
+// The input stage saturates before the ADC does: about 1740 counts from zero
+// were seen on range 0 (a 1.5 V cell read as 174 mV). The multimeter only
+// trusts 1400 counts, goes up a range above that and down below 900.
+#define DMM_FULL 1400
+#define DMM_LOW  900
 #define NDMM_R (sizeof DMM_R / sizeof DMM_R[0])
 static const uint32_t DMM_FS[] = {6000, 60000, 600000, 2400000};
 static const char* const DMM_LABEL[6] = {"VDC", "VRMS", "FREQ", "VPP", "VMAX", "VMIN"};
@@ -1153,7 +1158,7 @@ static LO void dmm_value_text(int k, char* b) {
 }
 static LO void dmm_range_text(char* b) {
     char* p = put(b, cfg.dmm_range ? "FIXA " : "AUTO ");
-    fmt_mv((int32_t)(ADC_LIMIT * 1000u / fe_counts_per_volt(DMM_R[d_r])) * pf(), p);
+    fmt_mv((int32_t)(DMM_FULL * 1000u / fe_counts_per_volt(DMM_R[d_r])) * pf(), p);
 }
 static LO void dmm_static(void) {
     char b[24];
@@ -1208,7 +1213,7 @@ static LO void pc_dmm(void) {
         p = put_i(p, (int32_t)v);
     }
     p = put_u(p, cfg.dmm_focus); p = put_u(p, d_hold); p = put_u(p, cfg.dmm_range);
-    p = put_u(p, ADC_LIMIT * 1000u / fe_counts_per_volt(DMM_R[d_r]) * (uint32_t)pf());
+    p = put_u(p, DMM_FULL * 1000u / fe_counts_per_volt(DMM_R[d_r]) * (uint32_t)pf());
     p = put_u(p, (uint32_t)pf()); p = put_u(p, cfg.dc); p = put_u(p, d_alert); p = put_u(p, d_clip);
     p[-1] = '\n';
     usb_write(b, (int)(p - b));
@@ -1236,11 +1241,11 @@ static LO int dmm_capture(void) {
     stats(g_acq, NCAP);
     int32_t z = zero();
     int32_t pk = m_max - z > z - m_min ? m_max - z : z - m_min;
-    d_clip = (uint8_t)(pk > ADC_LIMIT - 60 || m_max >= 4090 || m_min <= 5);
+    d_clip = (uint8_t)(pk > DMM_FULL || m_max >= 4090 || m_min <= 5);
     if (!cfg.dmm_range) {
         if (d_clip && d_r + 1 < (int)NDMM_R) { dmm_range_set(d_r + 1); return 0; }
         if (d_r > 0 && (int64_t)pk * fe_counts_per_volt(DMM_R[d_r - 1]) <
-                       (int64_t)ADC_LIMIT * 6 / 10 * fe_counts_per_volt(DMM_R[d_r])) {
+                       (int64_t)DMM_LOW * fe_counts_per_volt(DMM_R[d_r])) {
             dmm_range_set(d_r - 1); return 0;
         }
     }
