@@ -24,8 +24,16 @@ typedef struct {
     uint8_t  auto_off;          // 0 off, 1 5 min, 2 10 min, 3 30 min
     uint8_t  bright;            // backlight: 0 100 %, 1 75 %, 2 50 %, 3 25 %
     uint8_t  pad5;
+    // v2.1
+    uint32_t gen_hz;            // typed generator frequency (cfg.gen == GEN_CUSTOM), Hz
+    uint8_t  gen_duty;          // generator duty, 1..99 % (0 = 50 %)
+    uint8_t  avg;               // trace averaging: 0 off, 1 x4, 2 x8, 3 x16
+    int16_t  hpos;              // trigger x on the screen, pixels from the centre
+    uint8_t  dmm_focus;         // multimeter: the big value
+    uint8_t  dmm_range;         // multimeter: 0 auto, else fixed range n-1
+    uint8_t  pad6[2];
     uint32_t check;
 } Settings;
 
-int  settings_load(Settings* s);            // 1 if a valid record was found
+int  settings_load(Settings* s);            // 0 none, 1 current, 4 / 5 older record taken over
 int  settings_save(const Settings* s);      // 1 if written and verified

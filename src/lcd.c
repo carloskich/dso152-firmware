@@ -80,6 +80,7 @@ __attribute__((section(".fonts"))) static const Extra EXTRA[] = {
     {0xF5, {0x38, 0x46, 0x45, 0x46, 0x39}},     // o tilde
     {0xFA, {0x3C, 0x40, 0x42, 0x21, 0x7C}},     // u acute
     {0x394, {0x70, 0x4C, 0x43, 0x4C, 0x70}},    // capital delta (cursor differences)
+    {0x26A0, {0x78, 0x7E, 0x51, 0x7E, 0x78}},   // warning sign (dangerous voltage)
 };
 
 static const uint8_t* glyph5x7(unsigned code) {
@@ -89,11 +90,15 @@ static const uint8_t* glyph5x7(unsigned code) {
     return FONT5X7['?' - 0x20];
 }
 
-// next character of a UTF-8 string (only the 2-byte Latin-1 range is used)
+// next character of a UTF-8 string (2-byte Latin-1 / Greek, 3-byte for the warning sign)
 static unsigned utf8_next(const char** pp) {
     const unsigned char* p = (const unsigned char*)*pp;
     unsigned c = *p++;
     if ((c & 0xE0) == 0xC0 && (*p & 0xC0) == 0x80) c = ((c & 0x1F) << 6) | (*p++ & 0x3F);
+    else if ((c & 0xF0) == 0xE0 && (p[0] & 0xC0) == 0x80 && (p[1] & 0xC0) == 0x80) {
+        c = ((c & 0x0F) << 12) | ((p[0] & 0x3Fu) << 6) | (p[1] & 0x3Fu);
+        p += 2;
+    }
     *pp = (const char*)p;
     return c;
 }

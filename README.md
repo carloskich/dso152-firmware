@@ -4,7 +4,7 @@ Firmware novo e completo para o osciloscópio de bolso **FNIRSI DSO-152**, com i
 redesenhada, menus em português e uma **tela no PC** pelo USB, que abre direto no navegador
 sem instalar nada.
 
-Autor: **Carlos Santa Kich** · Licença: [MIT](LICENSE) · Versão atual: **v2.0**
+Autor: **Carlos Santa Kich** · Licença: [MIT](LICENSE) · Versão atual: **v2.1**
 ([notas de versão](CHANGELOG.md))
 
 > **Reversível.** O bootloader da FNIRSI não é alterado. Para voltar ao firmware original,
@@ -23,17 +23,24 @@ tela grande, acesso às configurações, histórico e exportação.
 ## O que ele faz
 
 **No aparelho**
-- Barra superior com estado (RUN / NORM / SNGL / ROLL / STOP), V/div, tempo/div, posição,
+- Barra superior com estado (RUN / MED / NORM / SNGL / ROLL / STOP), V/div, tempo/div, posição,
   trigger, DC/AC, gerador, conexão com o PC e bateria (com animação de carga).
 - Escalas de **10 mV a 20 V/div** e de **20 µs a 2 s/div**. De 50 ms/div em diante, **modo
   rolagem**: a onda corre da direita para a esquerda, sem esperar o trigger.
-- Trigger Auto, Normal e Single; borda de subida ou descida; nível automático ou manual.
+- Trigger Auto, Normal e Single; borda de subida ou descida; nível automático ou manual;
+  **posição do disparo** ajustável (pré-trigger) e, parado, navegação pela captura.
+- **Média de capturas** (4, 8 ou 16) para limpar o ruído de sinais repetitivos.
 - **AUTO** (ajuste automático) que acerta escala, posição e base de tempo, inclusive para
   sinais lentos, de poucos hertz.
 - Medidas à escolha nas cinco posições da barra de baixo: VPP, frequência, período,
-  duty cycle, média, RMS verdadeiro, máximo e mínimo.
+  duty cycle, média, RMS verdadeiro, máximo, mínimo, **tempo de subida** e **de descida**.
+- **Multímetro**: Vdc, Vrms, frequência, Vpp, máximo e mínimo ao mesmo tempo, com escala
+  automática ou fixa e HOLD.
+- **Aviso de tensão perigosa** (60 V DC, 30 V RMS ou 42 V de pico em AC) e aviso para usar a
+  ponta x10 acima de 35 V em x1.
 - **Cursores** de tempo (ΔT e 1/ΔT) e de tensão (C1, C2 e ΔV).
-- Gerador de onda quadrada (10 Hz a 100 kHz) no conector de saída.
+- **Gerador** de onda quadrada / PWM no conector de saída: frequências de 10 Hz a 100 kHz e
+  duty de 10 a 90 % no menu; pelo PC, de 1 Hz a 200 kHz e duty de 1 a 99 %.
 - Ponta x1 / x10, ajuste de zero de todas as faixas, restauração do zero de fábrica.
 - Desligamento automático por inatividade (só na bateria), brilho da tela ajustável,
   calibração da leitura da bateria, tela de diagnóstico e tela Sobre.
@@ -49,6 +56,10 @@ tela grande, acesso às configurações, histórico e exportação.
 - **Exportar** a tela em PNG (1920×1080) e a onda em CSV (abre direto no Excel).
 - **Registrador**: gráfico de uma medida ao longo do tempo (minutos ou horas),
   com mínimo, máximo e média, exportável em CSV.
+- **Espectro (FFT)**, **decodificação serial (UART)**, **onda de referência** para comparar e
+  **gravação de vídeo** (WebM).
+- Gerador com frequência e duty digitados, e a frequência realmente gerada.
+- Tela do multímetro, aviso de tensão perigosa e botão para desligar o aparelho.
 
 ## Telas
 
@@ -68,10 +79,23 @@ Imagens geradas pela própria página do PC, que desenha a tela do aparelho pixe
 <td><img src="docs/img/tela_menu_sistema.png" alt="Menu Sistema"><br><sub>Sistema: brilho, desligamento automático, bateria, diagnóstico, Sobre</sub></td>
 </tr>
 <tr>
+<td><img src="docs/img/tela_multimetro.png" alt="Multímetro"><br><sub>Multímetro: bateria de 12 V</sub></td>
+<td><img src="docs/img/tela_multimetro_rede.png" alt="Multímetro na rede"><br><sub>Rede elétrica com a ponta x10: valor em vermelho e aviso</sub></td>
+</tr>
+<tr>
+<td><img src="docs/img/tela_disparo_media.png" alt="Posição do disparo e média"><br><sub>Posição do disparo, média de capturas, subida e descida</sub></td>
+<td><img src="docs/img/tela_alerta.png" alt="Aviso de tensão perigosa"><br><sub>Aviso de tensão perigosa no rodapé</sub></td>
+</tr>
+<tr>
 <td><img src="docs/img/tela_rolagem.png" alt="Modo rolagem"><br><sub>Modo rolagem (50 ms/div a 2 s/div)</sub></td>
 <td><img src="docs/img/tela_fora_da_escala.png" alt="Aviso fora da escala"><br><sub>Aviso quando o sinal passa da tela</sub></td>
 </tr>
 </table>
+
+**Decodificação UART e espectro no PC:**
+
+<p align="center"><img src="docs/img/pc_uart_tela.png" width="560" alt="Bytes decodificados sobre a onda"></p>
+<p align="center"><img src="docs/img/pc_fft.png" width="800" alt="Espectro de uma onda quadrada"></p>
 
 **Tela cheia no PC**, em alta resolução e formato wide:
 
@@ -113,7 +137,7 @@ Teclado do PC: setas, Enter = OK, M = MODE, A = AUTO, espaço = RUN/STOP, F = te
 
 | Botão | Função |
 |---|---|
-| ◄ ► | escolhe o que ▲ ▼ ajustam: V/div, tempo/div, posição, trigger (e os cursores) |
+| ◄ ► | escolhe o que ▲ ▼ ajustam: V/div, tempo/div, posição, trigger, disparo (e os cursores) |
 | ▲ ▼ | muda o valor escolhido |
 | MODE | DC / AC |
 | RUN | roda / para (em Single, arma de novo) |
@@ -146,7 +170,7 @@ A página do PC é gerada a partir de `tools/page_template.html` com a fonte do 
 - **Convivência com o bootloader.** O aplicativo é ligado em 0x08003C00. O bootloader desenha a
   própria tela com uma fonte que fica dentro da área do aplicativo (0x08008000–0x080099FF), e esse
   trecho é preservado. Por isso o linker divide o código em duas regiões ao redor dele.
-- **Flash limitada.** Interface, menus, USB, cursores e medidas cabem em cerca de 47 KB.
+- **Flash limitada.** Interface, menus, USB, cursores, medidas e multímetro cabem em cerca de 45 KB.
 - **Calibração.** O ganho das 11 faixas foi aferido com multímetro. O zero de fábrica é lido da
   área de calibração da FNIRSI (0x0800FC00), que nunca é gravada.
 - **USB CDC sem biblioteca.** Driver escrito direto nos registradores do periférico USB. O
@@ -154,7 +178,7 @@ A página do PC é gerada a partir de `tools/page_template.html` com a fonte do 
   Serial, sem instalação.
 - **AUTO para sinais lentos.** A amplitude é medida em uma janela curta e em outra longa antes de
   escolher a escala, para acertar de primeira também em sinais de poucos hertz.
-- **Validação no hardware**, versão por versão, da v0.1 (relógio, tela e botões) à v2.0.
+- **Validação no hardware**, versão por versão, da v0.1 (relógio, tela e botões) à v2.1.
 
 ## Hardware (o que este firmware usa)
 
@@ -172,16 +196,18 @@ A página do PC é gerada a partir de `tools/page_template.html` com a fonte do 
 Linhas de texto. Do aparelho para o PC, enquanto a porta estiver aberta (DTR):
 
 ```
-I DSO152 v2.0                                         identificação
+I DSO152 v2.1                                         identificação
 W <Sa/s> <us/div> <mV/div> <ponta> <dc> <zero> <contagens/V> <trigger> <roll> <n>
 D <n amostras, 3 dígitos hexadecimais cada, contagens do ADC>
-M <vpp> <freq mHz> <média> <máx> <mín> <rms> <duty 0,1 %>      (mV na ponta)
-S <estado: run, trigger, seleção, posição, cursores, gerador, bateria, medidas>
-U 0 | U 1 <item>\t<título>\t<nome>\t<valor>... | U 2 <título>   (menu aberto)
+M <vpp> <freq mHz> <média> <máx> <mín> <rms> <duty 0,1 %> <subida> <descida>  (mV na ponta, 0,1 µs)
+S <estado: run, trigger, seleção, posição, cursores, gerador, bateria, medidas, duty,
+   frequência real, média, posição do disparo>
+U 0 | U 1 <item>\t<título>\t<nome>\t<valor>... | U 2 <título> | U 3 (multímetro)
+V <vdc> <vrms> <freq mHz> <vpp> <vmax> <vmin> (µV na ponta) <destaque> <hold> <escala> ...
 ```
 
 Do PC para o aparelho: `K U|D|L|R|O|M|A|S` aperta um botão; `C <x> <n>` muda um valor
-(V, T, P, L, C, E, M, X, G, U, R, S, Q, I — veja `pc_keys` em `src/main.c`).
+(V, T, P, L, C, E, M, X, G, U, R, S, Q, I, F, Y, A, H, Z — veja `pc_keys` em `src/main.c`).
 
 ## Agradecimentos
 

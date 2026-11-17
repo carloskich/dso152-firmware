@@ -1,4 +1,5 @@
-// DSO152 firmware v2.0 (measurement choice, auto power-off, brightness, menu on the PC)
+// DSO152 firmware v2.1 (multimeter, averaging, trigger position, rise/fall,
+// free generator frequency and duty, dangerous-voltage warning)
 //
 // Keys (as agreed with the user, 2026-11-16):
 //   LEFT / RIGHT   pick what UP / DOWN changes: V/div, time/div, position,
@@ -25,7 +26,10 @@
 #include "gen.h"
 #include "usb.h"
 
-#define FW_VER "v2.0"
+// functions placed below the bootloader font area (FLASH), where there is room
+#define LO __attribute__((section(".lotext"), noinline))
+
+#define FW_VER "v2.1"
 #define FW_AUTHOR "Carlos Santa Kich"
 
 // ----------------------------------------------------------- geometry ---
@@ -55,14 +59,18 @@ static const char* const TDIV_TXT[] = {"20us", "50us", "100us", "200us", "500us"
 #define NTDIV (sizeof TDIV_US / sizeof TDIV_US[0])
 #define TD_ROLL 10              // 50 ms/div and slower: roll mode
 
-enum { P_VDIV, P_TDIV, P_POS, P_TRIG, NPARAM, P_C1 = NPARAM, P_C2 };
+enum { P_VDIV, P_TDIV, P_POS, P_TRIG, NPARAM, P_HPOS = NPARAM, P_C1, P_C2 };
+#define HPOS_STEP (DIVX / 2)
+#define HPOS_MAX (NS / 2 - DIVX / 2)
 enum { CUR_OFF, CUR_TIME, CUR_VOLT };
 
 // generator steps (menu): off, then these frequencies, 50 % duty on PA0
-static const uint32_t GEN_HZ[] = {0, 10, 100, 1000, 10000, 100000};
-static const char* const GEN_TXT[] = {"Desligado", "10 Hz", "100 Hz", "1 kHz", "10 kHz", "100 kHz"};
+static const uint32_t GEN_HZ[] = {0, 10, 50, 60, 100, 500, 1000, 5000, 10000, 50000, 100000};
 #define NGEN (sizeof GEN_HZ / sizeof GEN_HZ[0])
-#define GEN_DEFAULT 3
+#define GEN_CUSTOM NGEN                 // cfg.gen: the frequency typed on the PC (cfg.gen_hz)
+#define GEN_DEFAULT 6                   // 1 kHz
+static const uint8_t DUTY_STEPS[] = {10, 25, 50, 75, 90};
+static const uint8_t AVG_N[4] = {1, 4, 8, 16};
 enum { TM_AUTO, TM_NORMAL, TM_SINGLE };
 
 // -------------------------------------------------------------- state ---
@@ -82,6 +90,13 @@ static int32_t  m_trig;                 // trigger level in counts
 static uint8_t  m_clip;
 static int32_t  f_min, f_max, f_avg, f_trig, f_rms;
 static uint8_t  f_valid;
+static uint32_t m_rise, m_fall;         // 10-90 % edge times, tenths of a microsecond, 0 unknown
+static uint32_t s_gen_real;             // generator frequency actually produced, mHz
+static uint16_t a_buf[NS];              // averaged trace, counts x16
+static uint16_t a_out[NS];              // the averaged trace in counts, for drawing
+static uint8_t  a_n;                    // captures in the average so far
+static int      s_start = -1, s_trig_at;   // last trace: first sample, trigger sample
+static int16_t  o_hx = -1;              // trigger-position marker drawn at this grid x
 
 static uint8_t  o_top[NS], o_bot[NS];
 static int16_t  o_trig_y = -1, o_zero_y = -1;
@@ -96,6 +111,12 @@ static uint8_t  s_zero_big, s_trig_big;
 
 static void mark_dirty(void) { s_dirty = 1; s_dirty_t = g_ms; }
 static int pf(void) { return cfg.probe10 ? 10 : 1; }
+static uint32_t gen_hz_now(void) {
+    if (cfg.gen == GEN_CUSTOM) return cfg.gen_hz;
+    return GEN_HZ[cfg.gen < NGEN ? cfg.gen : 0];
+}
+static int gen_duty_now(void) { return cfg.gen_duty >= 1 && cfg.gen_duty <= 99 ? cfg.gen_duty : 50; }
+static void gen_apply(void) { s_gen_real = gen_set(gen_hz_now(), (uint32_t)gen_duty_now()); }
 static int16_t* zero_tab(void) { return cfg.dc ? cfg.zero_dc : cfg.zero_ac; }
 static int32_t zero(void) { return zero_tab()[fe_range()]; }
 static int32_t cpv(void) { return (int32_t)fe_counts_per_volt(fe_range()); }
@@ -205,6 +226,7 @@ static void draw_grid(void) {
     o_banner = 0;
     o_guide_y = -1;
     o_cur[0] = o_cur[1] = -1;
+    o_hx = -1;
 }
 
 static void marker(int x, int y, int dir, uint16_t c, int big) {
@@ -219,7 +241,32 @@ static uint8_t  s_frame_new;            // a trace was drawn since the guide was
 static void guide_line(int y, uint16_t c) {
     for (int x = 0; x < GW; x += 6) lcd_fill(GX + x, y, 3, 1, c);
 }
+static int s_mark_x = NS / 2;            // where the trigger sample is on the screen
+static void hmark_erase(void) {
+    if (o_hx < 0) return;
+    for (int x = o_hx - 3; x <= o_hx + 3; x++) {
+        if (x < 0 || x >= NS) continue;
+        bg_col(x, GY, GY + 4);
+        if (o_top[x] != 0xFF && o_top[x] <= 4) {
+            int b = o_bot[x] > 4 ? 4 : o_bot[x];
+            lcd_fill(GX + x, GY + o_top[x], 1, b - o_top[x] + 1, C_WAVE);
+        }
+    }
+    o_hx = -1;
+}
+static void hmark_draw(void) {
+    int x = cfg.tdiv >= TD_ROLL ? -1 : s_mark_x;
+    if (x < 0 || x >= NS) { hmark_erase(); return; }
+    if (x != o_hx) hmark_erase();
+    int big = s_sel == P_HPOS;
+    for (int i = 0; i < 4; i++) {
+        int w = 7 - 2 * i;
+        lcd_fill(GX + x - w / 2, GY + i, w, 1, big ? C_TEXT : C_TRIG);
+    }
+    o_hx = (int16_t)x;
+}
 static void draw_markers(void) {
+    hmark_draw();
     int zy = y_of(zero());
     int zbig = s_sel == P_POS, tbig = s_sel == P_TRIG;
     if (zy != o_zero_y || zbig != s_zero_big) {
@@ -272,7 +319,7 @@ static void guide_update(void) {
 // being moved has long dashes, the other dots. The trace stays on top.
 #define C_CUR RGB(186, 140, 250)
 #define C_CUR_SEL RGB(255, 80, 200)         // the cursor being moved: bright pink, long dashes
-static int nsel(void) { return cfg.cursors ? NPARAM + 2 : NPARAM; }
+static int nsel(void) { return cfg.cursors ? P_C2 + 1 : P_HPOS + 1; }
 static int on_trace(int x, int y) {
     return o_top[x] != 0xFF && y >= GY + o_top[x] && y <= GY + o_bot[x];
 }
@@ -388,7 +435,7 @@ static void draw_top(void) {
     lcd_fill(0, 0, LCD_W, TB_H, C_BAR);
     uint16_t sc = !s_run ? C_RED : s_waiting ? C_TRIG : C_WAVED;
     const char* st = !s_run ? "STOP" : cfg.tdiv >= TD_ROLL ? "ROLL" : cfg.trig_mode == TM_NORMAL ? "NORM"
-                   : cfg.trig_mode == TM_SINGLE ? "SNGL" : "RUN";
+                   : cfg.trig_mode == TM_SINGLE ? "SNGL" : cfg.avg ? "MED" : "RUN";
     lcd_fill(3, 4, 36, TB_H - 8, sc);
     lcd_text(3 + (36 - lcd_text_w(st, 1)) / 2, 7, st, 1, C_TEXT, sc);
     for (int p = 0; p < NPARAM; p++) {
@@ -403,8 +450,8 @@ static void draw_top(void) {
         lcd_text(x, 7, b, 1, fg, bg);
     }
     lcd_text(238, 7, cfg.dc ? "DC" : "AC", 1, C_TEXT, C_BAR);
-    icon_square(256, 5, cfg.gen ? C_TIME : C_MUTED, C_BAR);
-    if (!cfg.gen) icon_cross(256, 5, C_RED);                 // generator off
+    icon_square(256, 5, gen_hz_now() ? C_TIME : C_MUTED, C_BAR);
+    if (!gen_hz_now()) icon_cross(256, 5, C_RED);            // generator off
     s_pc_drawn = (uint8_t)pc_state();
     icon_pc(272, 5, s_pc_drawn, C_BAR);
     icon_battery(294, 5, batt_level(), s_bat_chg, C_BAR);
@@ -412,20 +459,45 @@ static void draw_top(void) {
 
 // --------------------------------------------------------- bottom bar ---
 #define BB_Y (GY + GH + 2)
+static uint8_t s_hide_labels, o_alert_row;    // footer: warning shown in the label row
+static uint32_t isqrt(uint32_t ms);
+static int32_t rms_mv(void);
 static void meas_c(int x, const char* label, const char* val, uint16_t lc) {
-    lcd_fill(x, BB_Y + 8, 60, 8, C_BAR);
-    lcd_text(x, BB_Y + 8, label, 1, lc, C_BAR);
+    if (!s_hide_labels) {
+        lcd_fill(x, BB_Y + 8, 60, 8, C_BAR);
+        lcd_text(x, BB_Y + 8, label, 1, lc, C_BAR);
+    }
     int e = lcd_text(x, BB_Y + 22, val, 1, C_TEXT, C_BAR);
     lcd_fill(e, BB_Y + 22, x + 63 - e, 8, C_BAR);
 }
 static void meas(int x, const char* label, const char* val) { meas_c(x, label, val, C_MUTED); }
 static uint16_t cur_label_c(void) { return s_sel >= P_C1 ? C_CUR_SEL : C_CUR; }
 
+// Dangerous voltage at the probe tip (as a multimeter would warn): DC mean
+// 60 V or more, or an AC part of 30 V RMS / 42 V peak. With the probe set to
+// x1, 35 V or more is over what the input is meant for: use x10.
+// Returns 0, 1 dangerous, 2 over the x1 limit. Values in mV at the tip.
+static LO int alert_of(int32_t avg, int32_t rms, int32_t mx, int32_t mn) {
+    int32_t pk = mx > -mn ? mx : -mn;
+    if (!cfg.probe10 && pk >= 35000) return 2;
+    int32_t a = (avg < 0 ? -avg : avg) / 10, r = (rms < 0 ? -rms : rms) / 10;    // 10 mV units
+    uint32_t acr = r > a ? isqrt((uint32_t)(r * r - a * a)) : 0;
+    if (a >= 6000 || acr >= 3000 || (mx - mn) / 2 >= 42000) return 1;
+    return 0;
+}
+static const char* const ALERT_TXT[3] = {"", "\u26A0 Tensão perigosa", "\u26A0 Acima do limite: use x10"};
+static int scope_alert(void) {
+    if (!f_valid) return 0;
+    int p = pf();
+    return alert_of(mv_of_f(f_avg) * p, rms_mv() * p, mv_of_f(f_max) * p, mv_of_f(f_min) * p);
+}
+
+
 // What each of the five places of the bottom bar shows (menu: Medidas na tela)
-enum { MS_DEF, MS_VPP, MS_FREQ, MS_PER, MS_DUTY, MS_VMED, MS_VRMS, MS_VMAX, MS_VMIN, NMS };
-static const char* const MS_LABEL[NMS] = {"", "VPP", "FREQ", "PER", "DUTY", "VMED", "VRMS", "VMAX", "VMIN"};
+enum { MS_DEF, MS_VPP, MS_FREQ, MS_PER, MS_DUTY, MS_VMED, MS_VRMS, MS_VMAX, MS_VMIN, MS_RISE, MS_FALL, NMS };
+static const char* const MS_LABEL[NMS] = {"", "VPP", "FREQ", "PER", "DUTY", "VMED", "VRMS", "VMAX", "VMIN", "TSUB", "TDES"};
 static const char* const MS_NAME[NMS] = {"", "Pico a pico", "Frequência", "Período", "Duty cycle",
-                                         "Média", "RMS", "Máximo", "Mínimo"};
+                                         "Média", "RMS", "Máximo", "Mínimo", "Subida", "Descida"};
 static const uint8_t MS_DEFAULT[5] = {MS_VPP, MS_FREQ, MS_VMED, MS_VMAX, MS_VMIN};
 static uint8_t meas_id(int k) { uint8_t m = cfg.meas[k]; return (m && m < NMS) ? m : MS_DEFAULT[k]; }
 static int32_t rms_mv(void) { return f_rms * 1000 / (cpv() * 16); }
@@ -445,12 +517,24 @@ static void meas_value(uint8_t id, char* b) {
     case MS_VMED: fmt_mv(mv_of_f(f_avg) * p, b); break;
     case MS_VRMS: fmt_mv(rms_mv() * p, b); break;
     case MS_VMAX: fmt_mv(mv_of_f(f_max) * p, b); break;
+    case MS_RISE: case MS_FALL: {
+        uint32_t t = id == MS_RISE ? m_rise : m_fall;
+        if (t) fmt_time(t, b); else put(b, "--");
+        break; }
     default:      fmt_mv(mv_of_f(f_min) * p, b); break;
     }
 }
 static void draw_bottom(void) {
     static const int SX[5] = {6, 70, 134, 198, 262};
     char b[16];
+    // the label row alternates with a red warning every 2 s; the values stay
+    int al = scope_alert(), show = al && !((g_ms / 2000) & 1);
+    if (show) {
+        lcd_fill(0, BB_Y + 4, LCD_W, 15, C_RED);
+        lcd_text(8, BB_Y + 8, ALERT_TXT[al], 1, C_TEXT, C_RED);
+    } else if (o_alert_row) lcd_fill(0, BB_Y + 4, LCD_W, 15, C_BAR);
+    o_alert_row = (uint8_t)show;
+    s_hide_labels = (uint8_t)show;
     int nuser = cfg.cursors == CUR_VOLT ? 2 : cfg.cursors == CUR_TIME ? 3 : 5;
     for (int k = 0; k < nuser; k++) { uint8_t id = meas_id(k); meas_value(id, b); meas(SX[k], MS_LABEL[id], b); }
     if (cfg.cursors == CUR_VOLT) {
@@ -468,6 +552,15 @@ static void draw_bottom(void) {
         fmt_freq(t10 ? (uint32_t)(10000000000ull / t10) : 0, b);
         meas_c(262, "1/\u0394T", b, cur_label_c());
     }
+    if (s_sel == P_HPOS) {                          // trigger position, while it is being moved
+        int32_t px = cfg.hpos;
+        uint32_t t10 = (uint32_t)((uint64_t)(px < 0 ? -px : px) * TDIV_US[cfg.tdiv] * 10u / DIVX);
+        char* q = b;
+        if (px < 0) *q++ = '-';
+        fmt_time(t10, q);
+        meas_c(262, "DISPARO", b, C_TRIG);
+    }
+    s_hide_labels = 0;
 }
 
 static void toast(const char* t, uint16_t c) {
@@ -496,6 +589,37 @@ static void banner(void) {
 // ------------------------------------------------------------- signal ---
 // Returns the first sample to show, or -1 when Normal/Single found no trigger.
 // minimum, maximum, mean and frequency (mid-level crossings) of n samples
+static uint32_t isqrt(uint32_t ms) {
+    uint32_t r = 0;
+    for (uint32_t bit = 1u << 30; bit; bit >>= 2) {
+        if (ms >= r + bit) { ms -= r + bit; r = (r >> 1) + bit; } else r >>= 1;
+    }
+    return r;
+}
+// 10 % -> 90 % (rise) and 90 % -> 10 % (fall), averaged over the edges seen
+static LO void edges(const uint16_t* s, int cnt, int32_t mn, int32_t mx) {
+    m_rise = m_fall = 0;
+    int32_t span = mx - mn;
+    if (span < 24) return;
+    int32_t lo = mn + span / 10, hi = mx - span / 10;
+    int state = 0, last_lo = -1, last_hi = -1;          // state 1 = was low, 2 = was high
+    uint32_t rs = 0, rn = 0, fs = 0, fn = 0;
+    for (int i = 0; i < cnt; i++) {
+        int v = s[i];
+        if (v <= lo) {
+            if (state == 2 && last_hi >= 0) { fs += (uint32_t)(i - last_hi); fn++; }
+            state = 1; last_lo = i;
+        } else if (v >= hi) {
+            if (state == 1 && last_lo >= 0) { rs += (uint32_t)(i - last_lo); rn++; }
+            state = 2; last_hi = i;
+        }
+    }
+    if (rn) m_rise = (uint32_t)((uint64_t)rs * 10000000u / ((uint64_t)rn * s_fs));
+    if (fn) m_fall = (uint32_t)((uint64_t)fs * 10000000u / ((uint64_t)fn * s_fs));
+    if (rn && !m_rise) m_rise = 1;
+    if (fn && !m_fall) m_fall = 1;
+}
+
 static void stats(const uint16_t* s, int cnt) {
     int32_t mn = 4095, mx = 0, sum = 0;
     for (int i = 0; i < cnt; i++) {
@@ -509,11 +633,8 @@ static void stats(const uint16_t* s, int cnt) {
     uint64_t sq = 0;
     int32_t z = zero();
     for (int i = 0; i < cnt; i++) { int32_t d = (int32_t)s[i] - z; sq += (uint64_t)((int64_t)d * d); }
-    uint32_t ms = cnt ? (uint32_t)(sq / (uint32_t)cnt) : 0, r = 0;
-    for (uint32_t bit = 1u << 30; bit; bit >>= 2) {         // integer square root
-        if (ms >= r + bit) { ms -= r + bit; r = (r >> 1) + bit; } else r >>= 1;
-    }
-    m_rms = (int32_t)r;
+    m_rms = (int32_t)isqrt(cnt ? (uint32_t)(sq / (uint32_t)cnt) : 0);
+    edges(s, cnt, mn, mx);
     int32_t span = mx - mn, mid = (mn + mx) / 2;
     int32_t hy = span / 10; if (hy < 3) hy = 3;
     m_freq_mhz = 0;
@@ -542,21 +663,23 @@ static int analyse(void) {
     // trigger
     m_trig = cfg.trig_auto ? mid : zero() + mv_to_counts(cfg.trig_mv);
     int trig = -1;
+    int left = NS / 2 + cfg.hpos;               // trigger sample = first sample + left
     if (span >= 12 || !cfg.trig_auto) {
-        int armed = 0;
-        for (int i = 1; i < NCAP - NS / 2; i++) {
+        int armed = 0, last = NCAP - NS + left;
+        for (int i = 1; i <= last; i++) {
             int v = s[i];
             if (cfg.rising) {
                 if (v < m_trig - hy) armed = 1;
-                if (armed && v >= m_trig) { if (i >= NS / 2) { trig = i; break; } armed = 0; }
+                if (armed && v >= m_trig) { if (i >= left) { trig = i; break; } armed = 0; }
             } else {
                 if (v > m_trig + hy) armed = 1;
-                if (armed && v <= m_trig) { if (i >= NS / 2) { trig = i; break; } armed = 0; }
+                if (armed && v <= m_trig) { if (i >= left) { trig = i; break; } armed = 0; }
             }
         }
     }
-    if (trig >= 0) return trig - NS / 2;
-    return cfg.trig_mode == TM_AUTO ? NS / 2 : -1;
+    if (trig >= 0) { s_trig_at = trig; return trig - left; }
+    s_trig_at = (NCAP - NS) / 2 + left;
+    return cfg.trig_mode == TM_AUTO ? (NCAP - NS) / 2 : -1;
 }
 
 static void smooth(void) {
@@ -602,10 +725,15 @@ static void draw_trace(const uint16_t* s, int from) {
 //   S <run> <waiting> <trig mode> <selected> <position px> <rising> <trig auto>
 //     <trig mV> <cursors> <time cur 1> <time cur 2> <volt cur 1> <volt cur 2>
 //     <generator> <battery level> <charging> <5 bottom bar measurements>
+//     <duty %> <generator real mHz> <generator step> <averaging> <trigger x px>
+//     <typed generator Hz>
 // and what is open on the instrument:
 //   U 0                      the scope screen
 //   U 1 <item>\t<title>\t<name>\t<value>...   a menu, <item> highlighted
 //   U 2 <title>              another page (diagnostics, a dialog)
+//   U 3                      the multimeter, with its values in
+//   V <vdc> <vrms> <freq mHz> <vpp> <vmax> <vmin> (uV at the tip) <focus>
+//     <hold> <fixed range> <full scale mV> <probe> <dc> <alert> <over range>
 // The PC sends "K x" to press a key: U D L R (arrows) O (OK) M (MODE)
 // A (AUTO) S (RUN/STOP).
 static char s_pcbuf[1000];
@@ -636,19 +764,22 @@ static void pc_meas(void) {
     p = put_i(p, (mv_of_f(f_max) - mv_of_f(f_min)) * k); p = put_u(p, m_freq_mhz);
     p = put_i(p, mv_of_f(f_avg) * k); p = put_i(p, mv_of_f(f_max) * k); p = put_i(p, mv_of_f(f_min) * k);
     p = put_i(p, rms_mv() * k); p = put_i(p, m_duty);
+    p = put_u(p, m_rise); p = put_u(p, m_fall);
     p[-1] = '\n';
     usb_write(b, (int)(p - b));
 }
 static void pc_status(void) {
     if (usb_state() != 2) return;
-    char b[120], *p = b;
+    char b[180], *p = b;
     *p++ = 'S'; *p++ = ' ';
     p = put_u(p, s_run); p = put_u(p, s_waiting); p = put_u(p, cfg.trig_mode); p = put_u(p, s_sel);
     p = put_i(p, cfg.pos); p = put_u(p, cfg.rising); p = put_u(p, cfg.trig_auto); p = put_i(p, cfg.trig_mv);
     p = put_u(p, cfg.cursors);
     p = put_i(p, s_cur_t[0]); p = put_i(p, s_cur_t[1]); p = put_i(p, s_cur_v[0]); p = put_i(p, s_cur_v[1]);
-    p = put_u(p, GEN_HZ[cfg.gen < NGEN ? cfg.gen : 0]); p = put_i(p, batt_level()); p = put_u(p, s_bat_chg);
+    p = put_u(p, gen_hz_now()); p = put_i(p, batt_level()); p = put_u(p, s_bat_chg);
     for (int k = 0; k < 5; k++) p = put_u(p, meas_id(k));
+    p = put_u(p, (uint32_t)gen_duty_now()); p = put_u(p, s_gen_real); p = put_u(p, cfg.gen);
+    p = put_u(p, cfg.avg); p = put_i(p, cfg.hpos); p = put_u(p, cfg.gen_hz);
     p[-1] = '\n';
     usb_write(b, (int)(p - b));
 }
@@ -663,6 +794,9 @@ static void pc_hello(void) {
 //   C DC 1 / AC 0   E rising 1/0       M trigger mode  X probe x10 1/0
 //   G generator     U cursors          R run 1 / stop 0  S selected field
 //   Q measurement: place * 16 + measurement   I menu item: select it and OK
+//   F typed generator frequency, Hz   Y duty %   A averaging 0..3
+//   H trigger x, px from the centre
+//   Z 1 switch off (as holding the power key)
 static char     s_rxl[24];
 static uint8_t  s_rxn;
 static char     s_cmd_c;
@@ -966,10 +1100,10 @@ static void draw_about(void) {
 
     diag_section(y, "Novidades desta versão");                                          y += DROW + 3;
     static const char* const NEWS[] = {
-        "Medidas à escolha: VRMS, duty cycle, período",
-        "Desligamento automático e brilho da tela",
-        "Tela no PC (USB): menus, histórico, registro",
-        "Modo rolagem, cursores, AUTO para sinais lentos"};
+        "Multímetro com escala automática ou fixa",
+        "Média de capturas e posição do disparo",
+        "Tempo de subida/descida; aviso de tensão perigosa",
+        "Gerador: frequência livre (PC) e duty ajustável"};
     for (unsigned i = 0; i < sizeof NEWS / sizeof NEWS[0]; i++) {
         lcd_fill(DX + 2, y + 3, 2, 2, C_WAVE);
         lcd_text(DX + 10, y, NEWS[i], 1, C_TEXT, C_BG);                                y += DROW;
@@ -983,21 +1117,178 @@ static void draw_about(void) {
     lcd_text((LCD_W - lcd_text_w(foot, 1)) / 2, LCD_H - 13, foot, 1, C_MUTED, C_BAR);
 }
 
+// ---------------------------------------------------------- multimeter ---
+// Voltmeter page: every value at once, one of them big. The range follows
+// the signal (AUTO) or stays where the user put it; the sampling rate
+// follows the frequency so that slow and fast signals both read right.
+static const uint8_t DMM_R[] = {0, 1, 2, 4, 5, 7, 8};     // front-end ranges used
+#define NDMM_R (sizeof DMM_R / sizeof DMM_R[0])
+static const uint32_t DMM_FS[] = {6000, 60000, 600000, 2400000};
+static const char* const DMM_LABEL[6] = {"VDC", "VRMS", "FREQ", "VPP", "VMAX", "VMIN"};
+static uint8_t d_r, d_fsi, d_hold, d_skip, d_clip;
+static int64_t d_uv[6];                 // VDC VRMS - VPP VMAX VMIN, microvolts at the tip
+static uint8_t d_alert;
+
+static int64_t uv_of(int32_t f16) {
+    return (int64_t)(f16 - zero() * 16) * 1000000 / (cpv() * 16) * pf();
+}
+static LO char* fmt_uv(int64_t uv, char* p) {      // four significant digits
+    if (uv < 0) { *p++ = '-'; uv = -uv; }
+    uint32_t a = uv > 999999999 ? 999999999u : (uint32_t)uv, v;
+    const char* unit = "V";
+    if (a >= 1000000) v = a / 1000;                 // in mV, shown as V
+    else { v = a; unit = "mV"; }                    // in uV, shown as mV
+    p = u2s(v / 1000, p); *p++ = '.';
+    uint32_t r = v % 1000;
+    if (v < 10000) p = frac(r, 3, p);
+    else if (v < 100000) p = frac(r / 10, 2, p);
+    else p = frac(r / 100, 1, p);
+    if (a < 1000000 && v < 10000) p[-1] = 0, p--;   // x.xx mV: noise below that
+    return put(p, unit);
+}
+static LO void dmm_value_text(int k, char* b) {
+    if (k == 2) { fmt_freq(m_freq_mhz, b); return; }
+    if (d_clip && cfg.dmm_range) { put(b, "----"); return; }
+    fmt_uv(d_uv[k], b);
+}
+static LO void dmm_range_text(char* b) {
+    char* p = put(b, cfg.dmm_range ? "FIXA " : "AUTO ");
+    fmt_mv((int32_t)(ADC_LIMIT * 1000u / fe_counts_per_volt(DMM_R[d_r])) * pf(), p);
+}
+static LO void dmm_static(void) {
+    char b[24];
+    lcd_fill(0, 0, LCD_W, LCD_H, C_BG);
+    lcd_fill(0, 0, LCD_W, TB_H, C_BAR);
+    lcd_text(6, 7, "Multímetro", 1, C_TEXT, C_BAR);
+    lcd_text(76, 7, cfg.dc ? "DC" : "AC", 1, C_TEXT, C_BAR);
+    dmm_range_text(b);
+    lcd_text(98, 7, b, 1, cfg.dmm_range ? C_TRIG : C_TIME, C_BAR);
+    lcd_text(196, 7, cfg.probe10 ? "PONTA x10" : "PONTA x1", 1, cfg.probe10 ? C_TRIG : C_MUTED, C_BAR);
+    icon_battery(294, 5, batt_level(), s_bat_chg, C_BAR);
+    if (d_hold) { lcd_fill(250, 4, 36, TB_H - 8, C_RED); lcd_text(256, 7, "HOLD", 1, C_TEXT, C_RED); }
+    lcd_text(12, 50, DMM_LABEL[cfg.dmm_focus], 2, C_MUTED, C_BG);
+    for (int k = 0, j = 0; k < 6; k++) {
+        if (k == cfg.dmm_focus) continue;
+        int x = 8 + (j % 3) * 104, y = 138 + (j / 3) * 34;
+        lcd_text(x, y, DMM_LABEL[k], 1, C_MUTED, C_BG);
+        j++;
+    }
+    const char* k = "Setas: medida/ponta RUN:hold AUTO:escala OK:sair";
+    lcd_fill(0, LCD_H - 18, LCD_W, 18, C_BAR);
+    lcd_text((LCD_W - lcd_text_w(k, 1)) / 2, LCD_H - 13, k, 1, C_MUTED, C_BAR);
+}
+static LO void dmm_values(void) {
+    char b[24];
+    int al = d_alert;
+    if (al) { lcd_fill(0, 26, LCD_W, 16, C_RED); lcd_text(8, 30, ALERT_TXT[al], 1, C_TEXT, C_RED); }
+    else lcd_fill(0, 26, LCD_W, 16, C_BG);
+    dmm_value_text(cfg.dmm_focus, b);
+    int e = lcd_text(12, 76, b, 4, al ? C_RED : C_TEXT, C_BG);
+    lcd_fill(e, 76, LCD_W - e, 28, C_BG);
+    if (d_clip && cfg.dmm_range) lcd_text(12, 110, "FORA DA ESCALA", 1, C_RED, C_BG);
+    else lcd_fill(12, 110, 100, 8, C_BG);
+    for (int k = 0, j = 0; k < 6; k++) {
+        if (k == cfg.dmm_focus) continue;
+        int x = 8 + (j % 3) * 104, y = 150 + (j / 3) * 34;
+        dmm_value_text(k, b);
+        e = lcd_text(x, y, b, 2, C_TEXT, C_BG);
+        lcd_fill(e, y, x + 102 - e, 14, C_BG);
+        j++;
+    }
+}
+static LO void pc_dmm(void) {
+    if (usb_state() != 2) return;
+    char b[160], *p = b;
+    *p++ = 'V'; *p++ = ' ';
+    for (int k = 0; k < 6; k++) {
+        if (k == 2) { p = put_u(p, m_freq_mhz); continue; }
+        int64_t v = d_uv[k];
+        if (v > 2000000000) v = 2000000000;
+        if (v < -2000000000) v = -2000000000;
+        p = put_i(p, (int32_t)v);
+    }
+    p = put_u(p, cfg.dmm_focus); p = put_u(p, d_hold); p = put_u(p, cfg.dmm_range);
+    p = put_u(p, ADC_LIMIT * 1000u / fe_counts_per_volt(DMM_R[d_r]) * (uint32_t)pf());
+    p = put_u(p, (uint32_t)pf()); p = put_u(p, cfg.dc); p = put_u(p, d_alert); p = put_u(p, d_clip);
+    p[-1] = '\n';
+    usb_write(b, (int)(p - b));
+}
+static void dmm_range_set(int r) {
+    d_r = (uint8_t)r;
+    fe_set_range(DMM_R[d_r]);
+    f_valid = 0;
+    d_skip = 2;                         // the relay and the input settle
+}
+static LO void dmm_enter(void) {
+    d_fsi = 0; d_hold = 0; d_clip = 0;
+    if (cfg.dmm_focus > 5) cfg.dmm_focus = 0;
+    if (cfg.dmm_range > NDMM_R) cfg.dmm_range = 0;
+    dmm_range_set(cfg.dmm_range ? cfg.dmm_range - 1 : 3);
+    for (int k = 0; k < 6; k++) d_uv[k] = 0;
+    m_freq_mhz = 0;
+    d_alert = 0;
+    dmm_static();
+    dmm_values();
+}
+// One capture done: measure, change range / rate if needed. 1 = new values.
+static LO int dmm_capture(void) {
+    if (d_skip) { d_skip--; return 0; }
+    stats(g_acq, NCAP);
+    int32_t z = zero();
+    int32_t pk = m_max - z > z - m_min ? m_max - z : z - m_min;
+    d_clip = (uint8_t)(pk > ADC_LIMIT - 60 || m_max >= 4090 || m_min <= 5);
+    if (!cfg.dmm_range) {
+        if (d_clip && d_r + 1 < (int)NDMM_R) { dmm_range_set(d_r + 1); return 0; }
+        if (d_r > 0 && (int64_t)pk * fe_counts_per_volt(DMM_R[d_r - 1]) <
+                       (int64_t)ADC_LIMIT * 6 / 10 * fe_counts_per_volt(DMM_R[d_r])) {
+            dmm_range_set(d_r - 1); return 0;
+        }
+    }
+    // rate: at least 20 samples a period, at least 3 periods in the capture
+    if (m_freq_mhz) {
+        uint64_t per = (uint64_t)DMM_FS[d_fsi] * 1000u / m_freq_mhz;      // samples a period
+        if (per < 20 && d_fsi + 1 < 4) { d_fsi++; f_valid = 0; d_skip = 1; return 0; }
+        if (per * 3 > NCAP && d_fsi > 0) { d_fsi--; f_valid = 0; d_skip = 1; return 0; }
+    } else if (d_fsi > 0 && m_max - m_min < 24) { d_fsi = 0; f_valid = 0; d_skip = 1; return 0; }
+    smooth();
+    d_uv[0] = uv_of(f_avg);
+    d_uv[1] = (int64_t)f_rms * 1000000 / (cpv() * 16) * pf();
+    d_uv[4] = uv_of(f_max);
+    d_uv[5] = uv_of(f_min);
+    d_uv[3] = d_uv[4] - d_uv[5];
+    d_alert = (uint8_t)alert_of((int32_t)(d_uv[0] / 1000), (int32_t)(d_uv[1] / 1000),
+                                (int32_t)(d_uv[4] / 1000), (int32_t)(d_uv[5] / 1000));
+    return 1;
+}
+
 // --------------------------------------------------------------- menu ---
-// Three lists: the main menu, "Medidas na tela" and "Sistema".
-enum { I_TRIG, I_EDGE, I_PROBE, I_GEN, I_CUR, I_MEAS, I_ZERO, I_FACTORY, I_SYS, I_CLOSE,
-       I_M1, I_M2, I_M3, I_M4, I_M5, I_MDEF, I_BRIGHT, I_AUTOOFF, I_BATT, I_DIAG, I_ABOUT, I_BACK, NITEM };
+// Four lists: the main menu, "Medidas na tela", "Sistema" and "Gerador de sinal".
+enum { I_DMM, I_TRIG, I_EDGE, I_PROBE, I_CUR, I_AVG, I_GENM, I_MEAS, I_SYS, I_CLOSE,
+       I_M1, I_M2, I_M3, I_M4, I_M5, I_MDEF,
+       I_ZERO, I_FACTORY, I_BRIGHT, I_AUTOOFF, I_BATT, I_DIAG, I_ABOUT,
+       I_GEN, I_DUTY, I_BACK, NITEM };
 static const char* const ITEM_NAME[NITEM] = {
-    "Modo do trigger", "Borda do trigger", "Ponta de prova", "Gerador de sinal", "Cursores",
-    "Medidas na tela", "Ajustar zero (todas as faixas)", "Restaurar zero de fábrica", "Sistema", "Fechar",
+    "Multímetro", "Modo do trigger", "Borda do trigger", "Ponta de prova", "Cursores",
+    "Média de capturas", "Gerador de sinal", "Medidas na tela", "Sistema", "Fechar",
     "Posição 1", "Posição 2", "Posição 3", "Posição 4", "Posição 5", "Restaurar padrão",
-    "Brilho da tela", "Desligamento automático", "Calibrar bateria", "Diagnóstico", "Sobre", "Voltar"};
-static const uint8_t MN_MAIN[] = {I_TRIG, I_EDGE, I_PROBE, I_GEN, I_CUR, I_MEAS, I_ZERO, I_FACTORY, I_SYS, I_CLOSE};
+    "Ajustar zero (todas as faixas)", "Restaurar zero de fábrica",
+    "Brilho da tela", "Desligamento automático", "Calibrar bateria", "Diagnóstico", "Sobre",
+    "Frequência", "Duty cycle", "Voltar"};
+static const uint8_t MN_MAIN[] = {I_DMM, I_TRIG, I_EDGE, I_PROBE, I_CUR, I_AVG, I_GENM, I_MEAS, I_SYS, I_CLOSE};
 static const uint8_t MN_MEASL[] = {I_M1, I_M2, I_M3, I_M4, I_M5, I_MDEF, I_BACK};
-static const uint8_t MN_SYSL[] = {I_BRIGHT, I_AUTOOFF, I_BATT, I_DIAG, I_ABOUT, I_BACK};
-static const uint8_t* const MN_ITEMS[3] = {MN_MAIN, MN_MEASL, MN_SYSL};
-static const uint8_t MN_N[3] = {sizeof MN_MAIN, sizeof MN_MEASL, sizeof MN_SYSL};
-static const char* const MN_TITLE[3] = {"Configurações", "Medidas na tela", "Sistema"};
+static const uint8_t MN_SYSL[] = {I_ZERO, I_FACTORY, I_BRIGHT, I_AUTOOFF, I_BATT, I_DIAG, I_ABOUT, I_BACK};
+static const uint8_t MN_GENL[] = {I_GEN, I_DUTY, I_BACK};
+static const uint8_t* const MN_ITEMS[4] = {MN_MAIN, MN_MEASL, MN_SYSL, MN_GENL};
+static const uint8_t MN_N[4] = {sizeof MN_MAIN, sizeof MN_MEASL, sizeof MN_SYSL, sizeof MN_GENL};
+static const uint8_t MN_PARENT[4] = {I_CLOSE, I_MEAS, I_SYS, I_GENM};
+static const char* const MN_TITLE[4] = {"Configurações", "Medidas na tela", "Sistema", "Gerador de sinal"};
+static const char* const AVG_TXT[4] = {"Desligada", "4", "8", "16"};
+static char* gen_text(char* b) {
+    uint32_t hz = gen_hz_now();
+    if (!hz) return put(b, "Desligado");
+    char* p = hz >= 1000 && hz % 1000 == 0 ? u2s(hz / 1000, b) : u2s(hz, b);
+    return put(p, hz >= 1000 && hz % 1000 == 0 ? " kHz" : " Hz");
+}
 static const char* const BRIGHT_TXT[4] = {"100%", "75%", "50%", "25%"};
 static const uint8_t BRIGHT_PCT[4] = {100, 75, 50, 25};
 static const char* const AUTOOFF_TXT[4] = {"Desligado", "5 min", "10 min", "30 min"};
@@ -1009,13 +1300,18 @@ static uint8_t s_menu, s_mi;
 #define MROW 16
 
 static const char* item_value(int id) {
+    static char vb[16];
     switch (id) {
+    case I_GEN: gen_text(vb); return vb;
+    case I_GENM: put(gen_text(vb), " >"); return vb;
+    case I_DUTY: { char* q = u2s((uint32_t)gen_duty_now(), vb); put(q, "%"); return vb; }
+    case I_AVG:   return AVG_TXT[cfg.avg & 3];
     case I_TRIG:  return cfg.trig_mode == TM_NORMAL ? "Normal" : cfg.trig_mode == TM_SINGLE ? "Single" : "Auto";
     case I_EDGE:  return cfg.rising ? "Subida" : "Descida";
     case I_PROBE: return cfg.probe10 ? "x10" : "x1";
-    case I_GEN:   return GEN_TXT[cfg.gen < NGEN ? cfg.gen : 0];
     case I_CUR:   return cfg.cursors == CUR_TIME ? "Tempo" : cfg.cursors == CUR_VOLT ? "Tensão" : "Desligado";
     case I_MEAS: case I_SYS: return ">";
+    case I_DMM: return "Abrir";
     case I_M1: case I_M2: case I_M3: case I_M4: case I_M5: return MS_NAME[meas_id(id - I_M1)];
     case I_BRIGHT:  return BRIGHT_TXT[cfg.bright & 3];
     case I_AUTOOFF: return AUTOOFF_TXT[cfg.auto_off & 3];
@@ -1107,17 +1403,27 @@ static void load_config(void) {
     }
     if (!s_factory_ok) for (int r = 0; r < FE_RANGES; r++) fz_dc[r] = fz_ac[r] = 2048;
 
-    if (!settings_load(&cfg) || cfg.vdiv >= NVDIV || cfg.tdiv >= NTDIV || cfg.trig_mode > TM_SINGLE ||
+    int loaded = settings_load(&cfg);
+    if (loaded == 4 || loaded == 5) {               // v2.0 steps: off 10 100 1k 10k 100k
+        static const uint8_t OLD_GEN[6] = {0, 1, 4, 6, 8, 10};
+        cfg.gen = cfg.gen < 6 ? OLD_GEN[cfg.gen] : GEN_DEFAULT;
+    }
+    if (!loaded || cfg.vdiv >= NVDIV || cfg.tdiv >= NTDIV || cfg.trig_mode > TM_SINGLE ||
         cfg.pos > POS_MAX || cfg.pos < -POS_MAX) {
         cfg = (Settings){0};
         cfg.vdiv = 6; cfg.tdiv = 4; cfg.dc = 1; cfg.rising = 1; cfg.trig_auto = 1;
         cfg.trig_mode = TM_AUTO;
         cfg.gen = GEN_DEFAULT;
     }
-    if (cfg.gen >= NGEN) cfg.gen = GEN_DEFAULT;
+    if (cfg.gen > GEN_CUSTOM || (cfg.gen == GEN_CUSTOM && (cfg.gen_hz < GEN_MIN_HZ || cfg.gen_hz > GEN_MAX_HZ)))
+        cfg.gen = GEN_DEFAULT;
+    if (cfg.hpos > HPOS_MAX || cfg.hpos < -HPOS_MAX) cfg.hpos = 0;
+    cfg.avg &= 3;
+    if (cfg.dmm_focus > 5) cfg.dmm_focus = 0;
     if (cfg.cursors > CUR_VOLT) cfg.cursors = CUR_OFF;
     if (!cfg.user_zero) factory_zero();
     s_dirty = 0;
+    if (loaded == 4 || loaded == 5) mark_dirty();   // write it again in the new layout
 }
 
 int main(void) {
@@ -1129,7 +1435,7 @@ int main(void) {
     usb_init();
     load_config();
     fe_set_dc(cfg.dc);
-    gen_set(GEN_HZ[cfg.gen]);
+    gen_apply();
     backlight_set(BRIGHT_PCT[cfg.bright & 3]);
     pin_mode(GPIOA, 7, 0);                      // PA7: battery divider, analogue
     battery_poll();
@@ -1137,7 +1443,7 @@ int main(void) {
     m_trig = zero();
     redraw_all();
 
-    enum { PG_SCOPE, PG_MENU, PG_DIAG, PG_CONFIRM, PG_BATT, PG_MSG, PG_ABOUT } page = PG_SCOPE;
+    enum { PG_SCOPE, PG_MENU, PG_DIAG, PG_CONFIRM, PG_BATT, PG_MSG, PG_ABOUT, PG_DMM } page = PG_SCOPE;
     uint8_t pc_was = 0;
     uint32_t s_rep_t = 0;
     int s_rep_n = 0;
@@ -1149,6 +1455,13 @@ int main(void) {
         wdg_kick();
         keys_poll(&ev);
         pc_keys(&ev);
+        if (s_cmd_c == 'Z' && s_cmd_v == 1) {          // "desligar" on the PC page
+            acq_stop(); roll_stop();
+            if (s_dirty) settings_save(&cfg);
+            toast("Desligado pelo PC", C_TRIG);
+            delay_ms(600);
+            power_off();
+        }
         {
             int u = usb_state();
             static uint32_t t_st, t_fr;
@@ -1164,7 +1477,7 @@ int main(void) {
         // ---- power: hold 2 s
         if (ev.held & KB(K_POWER)) {
             if (!power_t0) power_t0 = g_ms | 1;
-            else if (g_ms - power_t0 > 2000) {
+            else if ((int32_t)(g_ms - power_t0) > 2000) {
                 acq_stop();
                 roll_stop();
                 if (s_dirty) settings_save(&cfg);
@@ -1193,7 +1506,9 @@ int main(void) {
             }
             if (!lim || usb_state() || s_bat_chg) s_act = g_ms | 1;
             else {
-                uint32_t idle = g_ms - s_act;
+                // s_act is g_ms | 1 (never 0), so it can be 1 ms ahead of g_ms: that
+                // must count as 0, not as 49 days of inactivity
+                uint32_t idle = (int32_t)(g_ms - s_act) > 0 ? g_ms - s_act : 0;
                 if (idle >= lim) {
                     acq_stop(); roll_stop();
                     if (s_dirty) settings_save(&cfg);
@@ -1217,15 +1532,15 @@ int main(void) {
         {
             static int8_t ui_sent = -1;
             static uint32_t t_ui;
-            int ui = page == PG_SCOPE ? 0 : page == PG_MENU ? 1 : 2;
+            int ui = page == PG_SCOPE ? 0 : page == PG_MENU ? 1 : page == PG_DMM ? 3 : 2;
             if (usb_state() != 2) ui_sent = -1;
             else if (ui != ui_sent || g_ms - t_ui > 1000) {
                 t_ui = g_ms;
                 ui_sent = (int8_t)ui;
                 if (ui == 1) pc_menu();
                 else {
-                    char b[40], *p = put(b, ui ? "U 2 " : "U 0");
-                    if (ui) p = put(p, page == PG_DIAG ? "Diagnóstico" : page == PG_BATT ? "Calibrar bateria" :
+                    char b[40], *p = put(b, ui == 3 ? "U 3" : ui ? "U 2 " : "U 0");
+                    if (ui == 2) p = put(p, page == PG_DIAG ? "Diagnóstico" : page == PG_BATT ? "Calibrar bateria" :
                                        page == PG_ABOUT ? "Sobre" : "Ajuste de zero");
                     *p++ = '\n';
                     usb_write(b, (int)(p - b));
@@ -1233,8 +1548,42 @@ int main(void) {
             }
         }
 
+        if (page == PG_DMM) {
+            if (s_cmd_c == 'X') { cfg.probe10 = s_cmd_v ? 1 : 0; mark_dirty(); dmm_static(); dmm_values(); }
+            s_cmd_c = 0;
+            if (ev.shortp & KB(K_OK)) {
+                acq_stop(); capturing = 0; a_n = 0;
+                page = PG_SCOPE; apply_scales(); redraw_all();
+                continue;
+            }
+            int redo = 0;
+            if (ev.press & (KB(K_UP) | KB(K_DOWN))) {
+                cfg.dmm_focus = (uint8_t)((cfg.dmm_focus + ((ev.press & KB(K_UP)) ? 5 : 1)) % 6);
+                mark_dirty(); redo = 1;
+            }
+            if (ev.press & (KB(K_LEFT) | KB(K_RIGHT))) { cfg.probe10 = !cfg.probe10; mark_dirty(); redo = 1; }
+            if (ev.shortp & KB(K_MODE)) {
+                cfg.dc = !cfg.dc; fe_set_dc(cfg.dc); f_valid = 0; d_skip = 2; mark_dirty(); redo = 1;
+            }
+            if (ev.shortp & KB(K_RUN)) { d_hold = !d_hold; redo = 1; }
+            if (ev.shortp & KB(K_AUTO)) {                // AUTO -> fixed here -> next ranges -> AUTO
+                if (!cfg.dmm_range) cfg.dmm_range = (uint8_t)(d_r + 1);
+                else if (cfg.dmm_range < NDMM_R) { cfg.dmm_range++; dmm_range_set(cfg.dmm_range - 1); }
+                else cfg.dmm_range = 0;
+                mark_dirty(); redo = 1;
+            }
+            if (redo) { dmm_static(); dmm_values(); pc_dmm(); }
+            if (d_hold) { battery_tick(); continue; }
+            if (!capturing) { s_fs = acq_start(DMM_FS[d_fsi], NCAP); capturing = 1; }
+            if (!acq_done()) continue;
+            capturing = 0;
+            battery_tick();
+            if (dmm_capture() && g_ms - t_bottom > 250) { t_bottom = g_ms; dmm_values(); pc_dmm(); }
+            continue;
+        }
+
         if (page == PG_DIAG) {
-            if (any & ~KB(K_POWER)) { page = PG_SCOPE; capturing = 0; gen_set(GEN_HZ[cfg.gen]); redraw_all(); continue; }
+            if (any & ~KB(K_POWER)) { page = PG_SCOPE; capturing = 0; gen_apply(); redraw_all(); continue; }
             if (g_ms - t_diag > 700) { t_diag = g_ms; draw_diag_values(); }
             continue;
         }
@@ -1297,7 +1646,18 @@ int main(void) {
                 case I_TRIG:  cfg.trig_mode = (uint8_t)((cfg.trig_mode + 1) % 3); s_run = 1; break;
                 case I_EDGE:  cfg.rising = !cfg.rising; break;
                 case I_PROBE: cfg.probe10 = !cfg.probe10; break;
-                case I_GEN:   cfg.gen = (uint8_t)((cfg.gen + 1) % NGEN); gen_set(GEN_HZ[cfg.gen]); break;
+                case I_GEN:
+                    if (cfg.gen >= GEN_CUSTOM) cfg.gen = 0;
+                    else if (cfg.gen + 1 < (int)NGEN) cfg.gen++;
+                    else cfg.gen = cfg.gen_hz >= GEN_MIN_HZ && cfg.gen_hz <= GEN_MAX_HZ ? GEN_CUSTOM : 0;
+                    gen_apply();
+                    break;
+                case I_DUTY: {
+                    int d0 = gen_duty_now(), nd = DUTY_STEPS[0];
+                    for (unsigned k = 0; k < sizeof DUTY_STEPS; k++) if (DUTY_STEPS[k] > d0) { nd = DUTY_STEPS[k]; break; }
+                    cfg.gen_duty = (uint8_t)nd; gen_apply();
+                    break; }
+                case I_AVG:   cfg.avg = (uint8_t)((cfg.avg + 1) & 3); a_n = 0; break;
                 case I_CUR:
                     cfg.cursors = (uint8_t)((cfg.cursors + 1) % 3);
                     if (s_sel >= nsel()) s_sel = P_VDIV;
@@ -1312,8 +1672,14 @@ int main(void) {
                 default: changed = 0;
                 }
                 if (changed) { mark_dirty(); draw_menu(); continue; }
-                if (id == I_MEAS || id == I_SYS) { s_menu = id == I_MEAS ? 1 : 2; s_mi = 0; redraw_all(); draw_menu(); continue; }
-                if (id == I_BACK) { s_mi = s_menu == 1 ? 5 : 8; s_menu = 0; redraw_all(); draw_menu(); continue; }
+                if (id == I_MEAS || id == I_SYS || id == I_GENM) {
+                    s_menu = id == I_MEAS ? 1 : id == I_SYS ? 2 : 3; s_mi = 0; redraw_all(); draw_menu(); continue;
+                }
+                if (id == I_BACK) {
+                    for (unsigned k = 0; k < sizeof MN_MAIN; k++) if (MN_MAIN[k] == MN_PARENT[s_menu]) s_mi = (uint8_t)k;
+                    s_menu = 0; redraw_all(); draw_menu(); continue;
+                }
+                if (id == I_DMM) { acq_stop(); roll_stop(); capturing = 0; page = PG_DMM; dmm_enter(); continue; }
                 if (id == I_ZERO) {
                     page = PG_CONFIRM;
                     lcd_fill(30, 70, 260, 84, C_GRID2);
@@ -1338,7 +1704,7 @@ int main(void) {
         // ---- scope page
         if (ev.shortp & KB(K_OK)) { page = PG_MENU; s_menu = 0; if (s_mi >= MN_N[0]) s_mi = 0; draw_menu(); continue; }
 
-        int rescale = 0, top = 0;
+        int rescale = 0, top = 0, hpos_moved = 0;
         if (s_cmd_c) {                                  // a value chosen on the PC
             char c = s_cmd_c;
             int32_t v = s_cmd_v;
@@ -1355,7 +1721,15 @@ int main(void) {
             case 'E': cfg.rising = v ? 1 : 0; break;
             case 'M': if (v >= 0 && v <= TM_SINGLE) { cfg.trig_mode = (uint8_t)v; s_run = 1; } break;
             case 'X': cfg.probe10 = v ? 1 : 0; break;
-            case 'G': if (v >= 0 && v < (int)NGEN) { cfg.gen = (uint8_t)v; gen_set(GEN_HZ[v]); } break;
+            case 'G':
+                if ((v >= 0 && v < (int)NGEN) || (v == GEN_CUSTOM && cfg.gen_hz >= GEN_MIN_HZ && cfg.gen_hz <= GEN_MAX_HZ)) {
+                    cfg.gen = (uint8_t)v; gen_apply();
+                }
+                break;
+            case 'F': if (v >= (int32_t)GEN_MIN_HZ && v <= (int32_t)GEN_MAX_HZ) { cfg.gen_hz = (uint32_t)v; cfg.gen = GEN_CUSTOM; gen_apply(); } break;
+            case 'Y': if (v >= 1 && v <= 99) { cfg.gen_duty = (uint8_t)v; gen_apply(); } break;
+            case 'A': if (v >= 0 && v <= 3) { cfg.avg = (uint8_t)v; a_n = 0; } break;
+            case 'H': if (v >= -HPOS_MAX && v <= HPOS_MAX) { cfg.hpos = (int16_t)v; a_n = 0; hpos_moved = 1; } break;
             case 'U': if (v >= 0 && v <= CUR_VOLT) { cfg.cursors = (uint8_t)v; if (s_sel >= nsel()) s_sel = P_VDIV; draw_grid(); } break;
             case 'R': s_run = v ? 1 : 0; s_waiting = 0; if (!s_run) roll_stop(); break;
             case 'S': if (v >= 0 && v < nsel()) s_sel = (uint8_t)v; break;
@@ -1398,6 +1772,13 @@ int main(void) {
                 if (p < -POS_MAX) p = -POS_MAX;
                 if (p != cfg.pos) { cfg.pos = (int16_t)p; rescale = 1; s_guide_t = g_ms; }
                 break; }
+            case P_HPOS: {
+                int h = cfg.hpos + d * HPOS_STEP;
+                if (h > HPOS_MAX) h = HPOS_MAX;
+                if (h < -HPOS_MAX) h = -HPOS_MAX;
+                if (h != cfg.hpos) { cfg.hpos = (int16_t)h; a_n = 0; hpos_moved = 1; }
+                draw_bottom();
+                break; }
             case P_TRIG: {
                 if (cfg.trig_auto) { cfg.trig_mv = counts_to_mv(m_trig - zero()); cfg.trig_auto = 0; }
                 cfg.trig_mv += d * (int32_t)VDIV_MV[cfg.vdiv] / 5;     // 0.2 division a step
@@ -1408,17 +1789,32 @@ int main(void) {
             }
             mark_dirty();
         }
-        if (ev.shortp & KB(K_MODE)) { cfg.dc = !cfg.dc; fe_set_dc(cfg.dc); f_valid = 0; draw_grid(); top = 1; mark_dirty(); }
+        if (hpos_moved) {
+            if (!s_run && s_start >= 0 && cfg.tdiv < TD_ROLL) {     // stopped: walk through the capture
+                int st = s_trig_at - (NS / 2 + cfg.hpos);
+                if (st < 0) st = 0;
+                if (st > NCAP - NS) st = NCAP - NS;
+                s_start = st;
+                s_mark_x = s_trig_at - st;
+                draw_trace(g_acq + st, 0);
+                pc_frame(g_acq + st, NS);
+                s_frame_new = 1;
+            } else s_mark_x = NS / 2 + cfg.hpos;
+            draw_markers();
+        }
+        if (ev.press & (KB(K_LEFT) | KB(K_RIGHT))) { draw_bottom(); draw_markers(); }     // DISPARO label, marker colour
+        if (ev.shortp & KB(K_MODE)) { cfg.dc = !cfg.dc; fe_set_dc(cfg.dc); f_valid = 0; a_n = 0; draw_grid(); top = 1; mark_dirty(); }
         if (ev.shortp & KB(K_RUN))  { s_run = !s_run; s_waiting = 0; top = 1; if (!s_run) roll_stop(); }
         if (ev.shortp & KB(K_AUTO)) {
             acq_stop(); roll_stop(); capturing = 0;
             autoset();
+            a_n = 0;
             s_run = 1;
             redraw_all();
             continue;
         }
         if (rescale) {
-            acq_stop(); roll_stop(); capturing = 0; r_n = 0;
+            acq_stop(); roll_stop(); capturing = 0; r_n = 0; a_n = 0;
             apply_scales();
             draw_grid();
             top = 1;
@@ -1462,10 +1858,24 @@ int main(void) {
             continue;
         }
         if (s_waiting) { s_waiting = 0; draw_top(); }
+        const uint16_t* tr = g_acq + start;
+        if (cfg.avg) {                                  // running average of the triggered traces
+            int n = AVG_N[cfg.avg & 3];
+            if (a_n < n) a_n++;
+            for (int i = 0; i < NS; i++) {
+                int32_t v16 = (int32_t)tr[i] * 16;
+                a_buf[i] = (uint16_t)(a_n == 1 ? v16 : a_buf[i] + (v16 - (int32_t)a_buf[i]) / a_n);
+                a_out[i] = (uint16_t)((a_buf[i] + 8) >> 4);
+            }
+            tr = a_out;
+            stats(tr, NS);                              // measure the cleaned trace
+        }
         smooth();
-        draw_trace(g_acq + start, 0);
+        s_start = start;
+        s_mark_x = NS / 2 + cfg.hpos;
+        draw_trace(tr, 0);
         s_frame_new = 1;
-        pc_frame(g_acq + start, NS);
+        pc_frame(tr, NS);
         banner();
         draw_markers();
         if (cfg.trig_mode == TM_SINGLE) { s_run = 0; draw_top(); draw_bottom(); pc_meas(); continue; }

@@ -1,5 +1,25 @@
 # Notas de versão
 
+## v2.1 — 17/11/2026
+
+**Aparelho**
+- **Multímetro** (Menu → Multímetro): Vdc, Vrms, frequência, Vpp, máximo e mínimo ao mesmo tempo,
+  um deles em destaque. Escala automática ou fixa (botão AUTO), HOLD (RUN), DC/AC (MODE) e ponta
+  x1/x10 nas setas ◄ ►.
+- **Aviso de tensão perigosa**: 60 V DC, 30 V RMS ou 42 V de pico em AC. Na ponta x1, aviso a partir
+  de 35 V para usar x10. No multímetro o valor fica vermelho; no osciloscópio o aviso aparece no rodapé.
+- **Média de capturas** (desligada, 4, 8 ou 16) para limpar o ruído de sinais repetitivos.
+- **Posição do disparo** (pré-trigger): novo campo depois do trigger, marcador laranja no topo da
+  grade. Parado (STOP), as setas percorrem a captura.
+- Medidas novas: **tempo de subida** e **tempo de descida** (10 % a 90 %).
+- **Gerador**: frequências fixas 10, 50, 60, 100 e 500 Hz, 1, 5, 10, 50 e 100 kHz; duty de 10 a 90 % no
+  menu (submenu "Gerador de sinal"). Ajustar zero e restaurar zero passaram para "Sistema".
+
+**PC**
+- Gerador com frequência livre de 1 Hz a 200 kHz e duty de 1 a 99 %, com a frequência real gerada.
+- Tela do multímetro e aviso de tensão perigosa também no PC.
+- Espectro (FFT), decodificação UART (8N1), onda de referência e gravação de vídeo WebM.
+
 ## v2.0 — 16/11/2026
 
 **Aparelho**

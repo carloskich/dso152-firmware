@@ -27,21 +27,20 @@ SECTIONS
     . = ALIGN(4);
   } >FLASH
 
-  /* Above the bootloader's font area: the main program and the USB driver
-     (code and constants), so the area below keeps room to spare. Listed
-     before .text so that these objects are taken here first. */
+  /* Above the bootloader's font area: the main program (code and constants)
+     except the functions marked LO (section .lotext), which go below with
+     the drivers. Listed before .text so that main.o is taken here first. */
   .text2 :
   {
     . = ALIGN(4);
     *main.o(.text .text* .rodata .rodata*)
-    *usb.o(.text .text* .rodata .rodata*)
     . = ALIGN(4);
   } >FLASH2
 
   .text :
   {
     . = ALIGN(4);
-    *(.text) *(.text*) *(.glue_7) *(.glue_7t) *(.eh_frame)
+    *(.text) *(.text*) *(.lotext) *(.glue_7) *(.glue_7t) *(.eh_frame)
     KEEP(*(.init)) KEEP(*(.fini))
     . = ALIGN(4);
     _etext = .;

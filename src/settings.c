@@ -2,7 +2,7 @@
 #include "hw.h"
 
 #define MAGIC 0x32353144u       // "D152"
-#define VERSION 5
+#define VERSION 6
 
 static uint32_t checksum_w(const uint32_t* w, unsigned n) {
     uint32_t sum = 0x5A5A0000u;
@@ -18,14 +18,17 @@ int settings_load(Settings* s) {
     const uint32_t* w = (const uint32_t*)SETTINGS_ADDR;
     if (f->magic != MAGIC) return 0;
     if (f->version == VERSION && f->check == checksum(f)) { *s = *f; return 1; }
-    // version 4 (v1.0 - v1.9): the same record without the 8 bytes added in
-    // v2.0 before the check. Taken over so the user's zero and battery
-    // calibration survive the update; the new fields start at 0 (defaults).
-    unsigned n4 = (sizeof(Settings) - 12) / 4;
-    if (f->version == 4 && w[n4] == checksum_w(w, n4)) {
-        uint32_t* d = (uint32_t*)s;
-        for (unsigned i = 0; i < sizeof(Settings) / 4; i++) d[i] = i < n4 ? w[i] : 0;
-        return 1;
+    // Older records are the same record cut short before the check: version
+    // 5 (v2.0) without the 12 bytes added in v2.1, version 4 (v1.0 - v1.9)
+    // also without the 8 bytes of v2.0. Taken over so the user's zero and
+    // battery calibration survive the update; new fields start at 0.
+    for (unsigned v = 5; v >= 4; v--) {
+        unsigned n = (sizeof(Settings) - 4 - 12 - (v == 4 ? 8 : 0)) / 4;
+        if (f->version == v && w[n] == checksum_w(w, n)) {
+            uint32_t* d = (uint32_t*)s;
+            for (unsigned i = 0; i < sizeof(Settings) / 4; i++) d[i] = i < n ? w[i] : 0;
+            return (int)v;
+        }
     }
     return 0;
 }
