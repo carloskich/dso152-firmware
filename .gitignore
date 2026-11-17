@@ -1,0 +1,15 @@
+# PlatformIO build
+.pio/
+.vscode/
+
+# build output (the release file goes to GitHub Releases, not the repository)
+out/
+
+# the original FNIRSI file is not ours to publish
+stock/
+
+# local copy-to folder
+tools/drop_dir.txt
+
+# Claude Code local settings
+.claude/
