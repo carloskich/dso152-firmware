@@ -5,7 +5,7 @@ redesenhada, menus em português e uma **tela no PC** pelo USB, que abre direto 
 sem instalar nada.
 
 Autor: **Carlos Santa Kich** · Licença: [MIT](LICENSE) · Versão atual: **v2.1**
-([notas de versão](CHANGELOG.md))
+([notas de versão](CHANGELOG.md)) · **[Manual do usuário](docs/MANUAL.md)**
 
 > **Reversível.** O bootloader da FNIRSI não é alterado. Para voltar ao firmware original,
 > basta instalar o arquivo da FNIRSI do mesmo jeito que se instala este.
@@ -144,6 +144,8 @@ Teclado do PC: setas, Enter = OK, M = MODE, A = AUTO, espaço = RUN/STOP, F = te
 | AUTO | ajuste automático |
 | OK | menu de configurações |
 | liga/desliga (segurar 2 s) | desliga |
+
+Tudo em detalhes no **[manual do usuário](docs/MANUAL.md)**.
 
 ## Compilando
 
