@@ -12,6 +12,14 @@ Autor: **Carlos Santa Kich** · Licença: [MIT](LICENSE) · Versão atual: **v2.
 
 <p align="center"><img src="docs/img/pagina_pc.png" width="720" alt="A tela do osciloscópio no PC, com os botões do aparelho"></p>
 
+## Motivação
+
+O DSO-152 é um osciloscópio de bolso de baixo custo com hardware capaz, mas o firmware original
+tem uma interface pouco intuitiva, poucas funções e nenhuma ligação com o PC além da atualização.
+Este projeto substitui o aplicativo por um firmware escrito do zero, com dois objetivos: tornar o
+aparelho prático no uso diário e permitir operá-lo pelo PC como um osciloscópio de bancada, com
+tela grande, acesso às configurações, histórico e exportação.
+
 ## O que ele faz
 
 **No aparelho**
@@ -128,6 +136,25 @@ Precisa do [PlatformIO](https://platformio.org/) (extensão do VS Code ou `pip i
 
 A página do PC é gerada a partir de `tools/page_template.html` com a fonte do aparelho:
 `python tools/mkpage.py pc/dso152_pc.html`.
+
+## Notas de desenvolvimento
+
+- **Sem abrir o aparelho e sem alterar o bootloader.** A instalação usa o drive *DSO BOOT*
+  original, então é sempre reversível. O mapa de pinos (tela paralela de 16 bits, ADC com TIM1 e
+  DMA, relé e 74HC4051 das 11 faixas, gerador, bateria) foi levantado a partir do firmware
+  original e de projetos da comunidade.
+- **Convivência com o bootloader.** O aplicativo é ligado em 0x08003C00. O bootloader desenha a
+  própria tela com uma fonte que fica dentro da área do aplicativo (0x08008000–0x080099FF), e esse
+  trecho é preservado. Por isso o linker divide o código em duas regiões ao redor dele.
+- **Flash limitada.** Interface, menus, USB, cursores e medidas cabem em cerca de 47 KB.
+- **Calibração.** O ganho das 11 faixas foi aferido com multímetro. O zero de fábrica é lido da
+  área de calibração da FNIRSI (0x0800FC00), que nunca é gravada.
+- **USB CDC sem biblioteca.** Driver escrito direto nos registradores do periférico USB. O
+  aparelho aparece como porta serial com o driver nativo do sistema, e a página do PC usa Web
+  Serial, sem instalação.
+- **AUTO para sinais lentos.** A amplitude é medida em uma janela curta e em outra longa antes de
+  escolher a escala, para acertar de primeira também em sinais de poucos hertz.
+- **Validação no hardware**, versão por versão, da v0.1 (relógio, tela e botões) à v2.0.
 
 ## Hardware (o que este firmware usa)
 
